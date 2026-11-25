@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# User data (SQLite + owner files)
+data/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+.DS_Store
