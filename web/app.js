@@ -105,7 +105,7 @@ let selCat = "";
 // store.state). The server keeps only an opaque encrypted blob
 // (web/crypto.js + /api/blob in app.py); the PIN key is derived locally and
 // never leaves the app, so the server owner cannot read any user's data.
-const WEB_APP_VERSION = 12; // must equal app.py WEB_VERSION (stale-JS banner)
+const WEB_APP_VERSION = 13; // must equal app.py WEB_VERSION (stale-JS banner)
 const C = window.MACrypto;
 const M = window.MALogic;
 const authCtx = { mode: null, legacyExport: null };
@@ -291,25 +291,33 @@ function screenNewPin(infoHtml) {
   };
 }
 // The 24-word phrase is shown ONCE here (and re-viewable later in Settings).
+// Two lists: Russian (index-paired display words) and English (canonical) —
+// same 24 indices, so either language recovers the same key.
 async function screenPhrase(pin) {
-  const words = await C.keyToMnemonic(await C.keyBytesOf(store._tmpKey));
+  const kb = await C.keyBytesOf(store._tmpKey);
+  const words = await C.keyToMnemonic(kb, "en");
+  const wordsRu = await C.keyToMnemonic(kb, "ru");
   authBox(`
     <div class="authwrap">
       <div class="authico"><span class="msrc">key</span></div>
       <div class="autht">Фраза восстановления</div>
-      <div class="authh">Скопируйте эти 24 слова и сохраните в надёжном месте.
+      <div class="authh">Скопируйте эти 24 слова и сохраните в надёжном месте — одинаковая фраза показана на русском и английском, при восстановлении введите любую из них.
         Если вы забудете ПИН, данные можно будет восстановить только по этой фразе.
         Никому её не показывайте и не отправляйте — с ней можно получить доступ к вашим данным.</div>
+      <div class="langlbl">Русский</div>
+      <div class="phrase" id="phraseGridRu">${wordsRu.map(w => `<span class="pw">${w}</span>`).join("")}</div>
+      <div class="langlbl">English</div>
       <div class="phrase" id="phraseGrid">${words.map(w => `<span class="pw">${w}</span>`).join("")}</div>
-      <button class="btn tonal" id="phCopy"><span class="msrc">copy</span>Скопировать фразу</button>
+      <button class="btn tonal" id="phCopy"><span class="msrc">copy</span>Скопировать фразу (РУ + EN)</button>
       <div class="setrow" style="margin-top:14px"><div class="lbl">Я сохранил(а) фразу</div>
         <label class="switch"><input type="checkbox" id="phSaved"><span class="sl"></span></label></div>
       <div id="authErr" class="autherr"></div>
       <button class="btn" id="phDone" disabled><span class="msrc">check</span>Готово</button>
     </div>`);
   document.getElementById("phCopy").onclick = async () => {
-    try { await navigator.clipboard.writeText(words.join(" ")); snackbar("Фраза скопирована"); }
-    catch (e) { snackbar("Скопируйте слова вручную"); }
+    const txt = phraseCopyText(wordsRu, words);
+    if (await copyText(txt)) snackbar("Фраза скопирована");
+    else copyFallback(txt, "Скопируйте фразу");
   };
   document.getElementById("phSaved").onchange = (e) => {
     document.getElementById("phDone").disabled = !e.target.checked;
@@ -346,9 +354,9 @@ function screenRecover() {
     <div class="authwrap">
       <div class="authico"><span class="msrc">restore</span></div>
       <div class="autht">Восстановление по фразе</div>
-      <div class="authh">Введите 24 слова фразы восстановления — в любом порядке ввода,
+      <div class="authh">Введите 24 слова фразы восстановления — на русском или английском,
         построчно или через запятую. Затем задайте новый ПИН.</div>
-      <textarea id="authPhrase" class="authphrase" rows="6" placeholder="abandon ability able …" autocomplete="off"></textarea>
+      <textarea id="authPhrase" class="authphrase" rows="6" placeholder="покинуть способность … или abandon ability …" autocomplete="off"></textarea>
       <div id="authErr" class="autherr"></div>
       <button class="btn" id="authGo"><span class="msrc">arrow_forward</span>Далее</button>
     </div>`);
@@ -464,6 +472,45 @@ function snackbar(msg) {
   el.classList.remove("hidden");
   clearTimeout(snTimer);
   snTimer = setTimeout(() => el.classList.add("hidden"), 3200);
+}
+
+// Clipboard that works inside the Telegram WebView: navigator.clipboard is
+// often unavailable/blocked there, so fall back to a hidden textarea +
+// execCommand("copy"); if that also fails, offer manual selection.
+async function copyText(t) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(t); return true; } catch (e) {}
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = t;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ta.setSelectionRange(0, t.length); } catch (e) {}
+    const ok = !!(document.execCommand && document.execCommand("copy"));
+    document.body.removeChild(ta);
+    if (ok) return true;
+  } catch (e) {}
+  return false;
+}
+
+// Last resort: show the text in a selectable dialog (long-press to select).
+function copyFallback(text, title) {
+  dialog({
+    title: title || "Скопируйте вручную",
+    text: "Автокопирование на этом устройстве не сработало. Удерживайте палец на тексте, чтобы выделить его, и скопируйте.",
+    body: `<textarea class="authphrase copyta" readonly rows="10">${esc(text)}</textarea>`,
+    buttons: [{ label: "Понятно", cls: "", act: "x", onclick: () => {} }],
+  });
+}
+
+// Both-language phrase for the copy button: one button copies two phrases,
+// Russian and English, separated and labeled.
+function phraseCopyText(wordsRu, wordsEn) {
+  return "Русский:\n" + wordsRu.join(" ") + "\n\nEnglish:\n" + wordsEn.join(" ");
 }
 
 // -------------------------------------------------------- sheet / dialog ---
@@ -1808,10 +1855,10 @@ async function renderSettings() {
       <button class="btn tonal" id="stCats"><span class="msrc">edit</span>Управление категориями</button>
     </div>
     <div class="card setsection"><div class="head"><span class="msrc">info</span><span class="t">О приложении</span></div>
-      <div style="font-size:14px;font-weight:600">MoneyAPP Web v1.12</div>
+      <div style="font-size:14px;font-weight:600">MoneyAPP Web v1.13</div>
       <div class="footer-note">Персональный финансовый трекер • Telegram mini-app</div>
       <div class="footer-note">Все данные шифруются прямо в мини-приложении на твоём телефоне. Ключ создаётся из твоего ПИН-кода и никуда не отправляется — не на сервер и не в Telegram. Поэтому даже владелец сервера не может прочитать твои данные.</div>
-      <div class="footer-note">При первом запуске ты получил(а) фразу из 24 слов — сохрани её в надёжном месте: это единственный способ вернуть данные, если забудешь ПИН.</div>
+      <div class="footer-note">При первом запуске ты получил(а) фразу из 24 слов (на русском и английском — это одна и та же фраза) — сохрани её в надёжном месте: это единственный способ вернуть данные, если забудешь ПИН. Ввести фразу при восстановлении можно на любом языке.</div>
     </div>`;
   const saveUser = async () => {
     try {
@@ -1922,14 +1969,19 @@ function phraseDialog() {
           err.textContent = "";
           try {
             const words = await store.phraseForPin(pin);
-            body.innerHTML = `<div class="phrase" style="margin:12px 0">${words.map(w => `<span class="pw">${w}</span>`).join("")}</div>
+            const wordsRu = C.mnemonicLang(words, "ru");
+            const txt = phraseCopyText(wordsRu, words);
+            body.innerHTML = `<div class="langlbl" style="margin-top:12px">Русский</div>
+              <div class="phrase">${wordsRu.map(w => `<span class="pw">${w}</span>`).join("")}</div>
+              <div class="langlbl">English</div>
+              <div class="phrase">${words.map(w => `<span class="pw">${w}</span>`).join("")}</div>
               <div class="footer-note">Эта фраза не меняется при смене ПИН. Сохраните её и никому не показывайте.</div>`;
             const cp = document.createElement("button");
             cp.className = "btn tonal"; cp.style.cssText = "width:100%;margin-top:8px";
-            cp.innerHTML = `<span class="msrc">copy</span>Скопировать фразу`;
+            cp.innerHTML = `<span class="msrc">copy</span>Скопировать фразу (РУ + EN)`;
             cp.onclick = async () => {
-              try { await navigator.clipboard.writeText(words.join(" ")); snackbar("Фраза скопирована"); }
-              catch (e) { snackbar("Скопируйте слова вручную"); }
+              if (await copyText(txt)) snackbar("Фраза скопирована");
+              else copyFallback(txt, "Скопируйте фразу");
             };
             body.appendChild(cp);
             dv.querySelector(".dbtn[data-act='s']").textContent = "Готово";

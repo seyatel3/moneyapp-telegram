@@ -577,6 +577,11 @@ body.nobnav .screen { padding-bottom: 24px; }
 }
 .pw { font-size: 13px; font-weight: 600; color: var(--on-surface); width: calc(50% - 3px); display: flex; gap: 6px; }
 .pw::before { content: counter(pw) ". "; counter-increment: pw; color: var(--on-surface-var); }
+.langlbl {
+  font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;
+  color: var(--on-surface-var); margin: 14px 0 6px; text-align: left;
+}
+.authphrase, .copyta { user-select: text; -webkit-user-select: text; }
 
 /* ---------- stale-JS banner ---------- */
 #vbanner {
