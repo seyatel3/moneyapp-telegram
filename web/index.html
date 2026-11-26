@@ -10,7 +10,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,0&display=block"
       rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=8">
+<link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
 <div id="app">
@@ -51,7 +51,15 @@
   </div>
 
   <div id="snackbar" class="hidden"></div>
+
+  <!-- stale-JS banner (server-side web version mismatch) -->
+  <div id="vbanner" class="hidden"></div>
+
+  <!-- auth overlay: PIN entry / setup / phrase / recovery (E2E v1.11.10) -->
+  <div id="auth" class="hidden"></div>
 </div>
-<script src="app.js?v=8"></script>
+<script src="crypto.js?v=12"></script>
+<script src="logic.js?v=12"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>

@@ -532,3 +532,56 @@ body.nobnav .screen { padding-bottom: 24px; }
 
 .capstat { font-size: 12px; font-weight: 600; }
 .footer-note { font-size: 11px; font-weight: 500; color: var(--on-surface-var); margin-top: 8px; }
+
+/* ---------- E2E auth screens (PIN / phrase) ---------- */
+#auth {
+  position: fixed; inset: 0; z-index: 200;
+  background: var(--bg);
+  overflow-y: auto;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: max(env(safe-area-inset-top), 24px) 16px 40px;
+}
+.authwrap { width: 100%; max-width: 420px; margin-top: 8vh; text-align: center; }
+.authico {
+  width: 64px; height: 64px; border-radius: 20px; margin: 0 auto 16px;
+  background: var(--primary-container); color: var(--on-primary-container);
+  display: flex; align-items: center; justify-content: center;
+}
+.authico .msrc { font-size: 30px; }
+.autht { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+.authh { font-size: 13px; color: var(--on-surface-var); line-height: 1.5; margin-bottom: 18px; }
+.authpin {
+  width: 100%; max-width: 240px; margin: 0 auto; display: block;
+  background: var(--surface); border: 1px solid var(--outline);
+  border-radius: 14px; color: var(--on-surface);
+  font-size: 26px; font-weight: 700; letter-spacing: 8px; text-align: center;
+  padding: 14px 8px; outline: none; box-sizing: border-box;
+}
+.authpin:focus { border-color: var(--primary); }
+.authphrase {
+  width: 100%; box-sizing: border-box; resize: none;
+  background: var(--surface); border: 1px solid var(--outline);
+  border-radius: 14px; color: var(--on-surface);
+  font-size: 15px; padding: 12px; outline: none; margin-bottom: 12px;
+}
+.authphrase:focus { border-color: var(--primary); }
+.autherr { color: var(--error); font-size: 13px; font-weight: 600; min-height: 18px; margin: 10px 0 4px; }
+.authwrap .field { text-align: left; margin-bottom: 12px; }
+.authwrap .btn { width: 100%; max-width: 320px; margin: 14px auto 0; }
+.authwrap .btn.text { background: transparent; color: var(--on-surface-var); margin-top: 10px; }
+.phrase {
+  background: var(--surface); border: 1px solid var(--outline);
+  border-radius: 14px; padding: 14px; text-align: left;
+  display: flex; flex-wrap: wrap; gap: 6px 4px; margin: 14px 0;
+  counter-reset: pw;
+}
+.pw { font-size: 13px; font-weight: 600; color: var(--on-surface); width: calc(50% - 3px); display: flex; gap: 6px; }
+.pw::before { content: counter(pw) ". "; counter-increment: pw; color: var(--on-surface-var); }
+
+/* ---------- stale-JS banner ---------- */
+#vbanner {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 300;
+  background: var(--warning); color: #231A02;
+  text-align: center; font-size: 13px; font-weight: 600;
+  padding: 8px 16px; cursor: pointer;
+}

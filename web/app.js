@@ -100,21 +100,347 @@ const state = {
 const tui = { open: true, groups: { INCOME: false, EXPENSE: true, SAVINGS: false, SAVINGS_SPEND: false } };
 let selCat = "";
 
+// ================================================================ E2E ======
+// v1.11.10: all business logic runs in the browser (MALogic over
+// store.state). The server keeps only an opaque encrypted blob
+// (web/crypto.js + /api/blob in app.py); the PIN key is derived locally and
+// never leaves the app, so the server owner cannot read any user's data.
+const WEB_APP_VERSION = 12; // must equal app.py WEB_VERSION (stale-JS banner)
+const C = window.MACrypto;
+const M = window.MALogic;
+const authCtx = { mode: null, legacyExport: null };
+
+const store = {
+  state: null,   // canonical dataset (logic.js shape), in memory only
+  key: null,     // random 32 B master key (AES-GCM), in memory only
+  pin: null,     // current PIN, in memory only
+  uid: 0,
+  rev: -1,       // optimistic-lock counter from /api/blob
+  today: null,   // the SERVER's today (epoch day, MSK) — all date math uses it
+  async http(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json", "X-Init-Data": state.initData },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const e = new Error(data.error || ("HTTP " + res.status));
+      e.status = res.status;
+      e.data = data;
+      throw e;
+    }
+    return data;
+  },
+  async load() {
+    const d = await this.http("GET", "/api/blob");
+    this.rev = d.rev;
+    this.today = d.today;
+    return d.has ? d.blob : null;
+  },
+  _dataBlob(blob) { return { v: blob.v, iv: blob.iv, ct: blob.ct }; },
+  // Apply an in-place mutation op(state), then persist the whole blob with
+  // optimistic locking. On 409 (newer save elsewhere) re-fetch, re-decrypt
+  // and re-apply the op on the fresh state (up to 3 tries).
+  async mutate(op) {
+    for (let i = 0; i < 3; i++) {
+      const snapshot = JSON.parse(JSON.stringify(this.state));
+      let out;
+      try { out = op(this.state); }
+      catch (e) { this.state = snapshot; throw e; }
+      try {
+        await this.save();
+        return out;
+      } catch (e) {
+        if (e.status === 409) {
+          const blob = await this.load();
+          this.state = await C.decryptBlob(this._dataBlob(blob), this.key);
+          continue;
+        }
+        this.state = snapshot; // not persisted — roll back the in-memory change
+        throw e;
+      }
+    }
+    throw new Error("Конфликт версий — попробуйте ещё раз");
+  },
+  async save() {
+    const wrap = await C.wrapMasterKey(this.key, this.pin, this.uid);
+    const db = await C.encryptData(this.state, this.key);
+    const blob = { v: 1, ivKey: wrap.ivKey, ctKey: wrap.ctKey, iv: db.iv, ct: db.ct };
+    const d = await this.http("PUT", "/api/blob", { rev: this.rev, blob });
+    this.rev = d.rev;
+  },
+  // Unlock an existing blob with the PIN (throws "wrong key" on bad PIN).
+  async unlockPin(pin) {
+    if (!C.validPin(pin)) throw new Error("ПИН: 4–6 цифр");
+    const blob = await this.load();
+    if (!blob) throw new Error("На сервере пока нет данных");
+    this.key = await C.unwrapMasterKey(blob, pin, this.uid);
+    this.state = await C.decryptBlob(this._dataBlob(blob), this.key);
+    this.pin = pin;
+  },
+  // First launch / migration: key already generated, show phrase, then save.
+  async firstSave(pin, key, st) {
+    if (!C.validPin(pin)) throw new Error("ПИН: 4–6 цифр");
+    this.key = key;
+    this.state = st;
+    this.pin = pin;
+    await this.load(); // sync rev/today from the server (returns blob|null)
+    await this.save();
+  },
+  // Recovery: 24-word phrase -> master key -> decrypt.
+  async unlockPhrase(words) {
+    this.key = await C.keyFromMnemonic(words);
+    const blob = await this.load();
+    if (!blob) throw new Error("На сервере пока нет данных");
+    this.state = await C.decryptBlob(this._dataBlob(blob), this.key);
+  },
+  // New PIN after phrase recovery (same master key -> phrase unchanged).
+  async setPin(pin) {
+    if (!C.validPin(pin)) throw new Error("ПИН: 4–6 цифр");
+    this.pin = pin;
+    await this.save();
+  },
+  // Phrase for the settings "show phrase" action: PIN-verify, then derive
+  // the mnemonic from the in-memory key. Throws "wrong key" on bad PIN.
+  async phraseForPin(pin) {
+    if (!C.validPin(pin)) throw new Error("ПИН: 4–6 цифр");
+    const blob = await this.load();
+    const k = await C.unwrapMasterKey(blob, pin, this.uid);
+    return C.keyToMnemonic(await C.keyBytesOf(k));
+  },
+  // Change PIN: verify the current one, re-wrap the same master key under
+  // the new PIN. The master key (and the phrase) are untouched.
+  async changePin(oldPin, newPin) {
+    if (!C.validPin(newPin)) throw new Error("Новый ПИН: 4–6 цифр");
+    const blob = await this.load();
+    await C.unwrapMasterKey(blob, oldPin, this.uid); // throws "wrong key"
+    this.pin = newPin;
+    await this.save();
+  },
+};
+
+// -------------------------------------------------------------- auth UI ----
+function authBox(html) {
+  const a = document.getElementById("auth");
+  a.innerHTML = html;
+  a.classList.remove("hidden");
+}
+function authDone() {
+  document.getElementById("auth").classList.add("hidden");
+  state.settings = store.state.settings;
+  state.categories = M.listCats(store.state).categories;
+  if (!state.settings.username && state.user && state.user.first_name)
+    state.settings.username = state.user.first_name;
+  applyTheme(state.settings.themeMode || "system");
+  if (document.querySelector(".screen.active")) refresh();
+  else showTab("dashboard");
+}
+function showVBanner() {
+  const b = document.getElementById("vbanner");
+  b.textContent = "Обнаружена новая версия приложения — нажмите, чтобы обновить";
+  b.classList.remove("hidden");
+  b.onclick = () => location.reload();
+}
+function screenPin() {
+  authBox(`
+    <div class="authwrap">
+      <div class="authico"><span class="msrc">lock</span></div>
+      <div class="autht">Введите ПИН</div>
+      <div class="authh">Вход в MoneyAPP — данные расшифруются только на этом устройстве</div>
+      <input id="authPin" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off">
+      <div id="authErr" class="autherr"></div>
+      <button class="btn" id="authGo"><span class="msrc">check</span>Войти</button>
+      <button class="btn text" id="authRecover"><span class="msrc">restore</span>Забыл ПИН — восстановить по фразе</button>
+    </div>`);
+  const go = async () => {
+    try {
+      await store.unlockPin(document.getElementById("authPin").value.trim());
+      authDone();
+    } catch (e) {
+      document.getElementById("authErr").textContent =
+        e.message === "wrong key" ? "Неверный ПИН" : e.message;
+    }
+  };
+  document.getElementById("authGo").onclick = go;
+  document.getElementById("authPin").addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  document.getElementById("authRecover").onclick = screenRecover;
+}
+// First launch ("setup") or legacy migration ("migrate"): pick a PIN first.
+function screenNewPin(infoHtml) {
+  authBox(`
+    <div class="authwrap">
+      <div class="authico"><span class="msrc">fingerprint</span></div>
+      <div class="autht">Придумайте ПИН</div>
+      ${infoHtml}
+      <div class="field"><label>ПИН (4–6 цифр)</label><input id="authPin1" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div class="field"><label>Ещё раз</label><input id="authPin2" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div id="authErr" class="autherr"></div>
+      <button class="btn" id="authGo"><span class="msrc">arrow_forward</span>Далее</button>
+    </div>`);
+  document.getElementById("authGo").onclick = async () => {
+    const p1 = document.getElementById("authPin1").value.trim();
+    const p2 = document.getElementById("authPin2").value.trim();
+    const err = document.getElementById("authErr");
+    if (!C.validPin(p1)) { err.textContent = "ПИН: 4–6 цифр"; return; }
+    if (p1 !== p2) { err.textContent = "ПИН не совпадает"; return; }
+    try {
+      store._tmpKey = await C.genMasterKey();
+      await screenPhrase(p1);
+    } catch (e) { err.textContent = e.message; }
+  };
+}
+// The 24-word phrase is shown ONCE here (and re-viewable later in Settings).
+async function screenPhrase(pin) {
+  const words = await C.keyToMnemonic(await C.keyBytesOf(store._tmpKey));
+  authBox(`
+    <div class="authwrap">
+      <div class="authico"><span class="msrc">key</span></div>
+      <div class="autht">Фраза восстановления</div>
+      <div class="authh">Скопируйте эти 24 слова и сохраните в надёжном месте.
+        Если вы забудете ПИН, данные можно будет восстановить только по этой фразе.
+        Никому её не показывайте и не отправляйте — с ней можно получить доступ к вашим данным.</div>
+      <div class="phrase" id="phraseGrid">${words.map(w => `<span class="pw">${w}</span>`).join("")}</div>
+      <button class="btn tonal" id="phCopy"><span class="msrc">copy</span>Скопировать фразу</button>
+      <div class="setrow" style="margin-top:14px"><div class="lbl">Я сохранил(а) фразу</div>
+        <label class="switch"><input type="checkbox" id="phSaved"><span class="sl"></span></label></div>
+      <div id="authErr" class="autherr"></div>
+      <button class="btn" id="phDone" disabled><span class="msrc">check</span>Готово</button>
+    </div>`);
+  document.getElementById("phCopy").onclick = async () => {
+    try { await navigator.clipboard.writeText(words.join(" ")); snackbar("Фраза скопирована"); }
+    catch (e) { snackbar("Скопируйте слова вручную"); }
+  };
+  document.getElementById("phSaved").onchange = (e) => {
+    document.getElementById("phDone").disabled = !e.target.checked;
+  };
+  document.getElementById("phDone").onclick = async () => {
+    const done = document.getElementById("phDone");
+    done.disabled = true;
+    try {
+      if (authCtx.mode === "migrate") {
+        const st = M.normalizeExport(authCtx.legacyExport);
+        if (state.user && state.user.first_name && !st.settings.username)
+          st.settings.username = state.user.first_name;
+        await store.firstSave(pin, store._tmpKey, st);
+        // mark the legacy DB migrated (30-day undo window on the server);
+        // if this fails the blob is already safe, the marker can be set later
+        try { await store.http("POST", "/api/migration_complete"); } catch (e) { /* ignore */ }
+      } else {
+        const st = M.freshState();
+        if (state.user && state.user.first_name) st.settings.username = state.user.first_name;
+        await store.firstSave(pin, store._tmpKey, st);
+      }
+      store._tmpKey = null;
+      authDone();
+      snackbar("Готово! Данные зашифрованы и сохранены");
+    } catch (e) {
+      document.getElementById("authErr").textContent = e.message;
+      done.disabled = false;
+    }
+  };
+}
+// Forgot PIN: enter the 24 words, then set a new PIN (phrase stays the same).
+function screenRecover() {
+  authBox(`
+    <div class="authwrap">
+      <div class="authico"><span class="msrc">restore</span></div>
+      <div class="autht">Восстановление по фразе</div>
+      <div class="authh">Введите 24 слова фразы восстановления — в любом порядке ввода,
+        построчно или через запятую. Затем задайте новый ПИН.</div>
+      <textarea id="authPhrase" class="authphrase" rows="6" placeholder="abandon ability able …" autocomplete="off"></textarea>
+      <div id="authErr" class="autherr"></div>
+      <button class="btn" id="authGo"><span class="msrc">arrow_forward</span>Далее</button>
+    </div>`);
+  document.getElementById("authGo").onclick = async () => {
+    const words = C.parsePhrase(document.getElementById("authPhrase").value);
+    const err = document.getElementById("authErr");
+    try {
+      await store.unlockPhrase(words);
+      authBox(`
+        <div class="authwrap">
+          <div class="authico"><span class="msrc">fingerprint</span></div>
+          <div class="autht">Данные восстановлены</div>
+          <div class="authh">Фраза верна. Задайте новый ПИН для входа — фраза восстановления при этом не меняется.</div>
+          <div class="field"><label>Новый ПИН (4–6 цифр)</label><input id="authPin1" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+          <div class="field"><label>Ещё раз</label><input id="authPin2" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+          <div id="authErr2" class="autherr"></div>
+          <button class="btn" id="authGo2"><span class="msrc">check</span>Готово</button>
+        </div>`);
+      document.getElementById("authGo2").onclick = async () => {
+        const p1 = document.getElementById("authPin1").value.trim();
+        const p2 = document.getElementById("authPin2").value.trim();
+        const err2 = document.getElementById("authErr2");
+        if (!C.validPin(p1)) { err2.textContent = "ПИН: 4–6 цифр"; return; }
+        if (p1 !== p2) { err2.textContent = "ПИН не совпадает"; return; }
+        try {
+          await store.setPin(p1);
+          authDone();
+        } catch (e) { err2.textContent = e.message; }
+      };
+    } catch (e) {
+      err.textContent = e.message === "wrong key" ? "Неверная фраза" : e.message;
+    }
+  };
+}
+
 // ------------------------------------------------------------------- api ---
+// The UI calls api(method, path, body, query) exactly like the old server
+// API; this routes reads to MALogic over store.state and persists mutations
+// as a re-encrypted blob (store.mutate). Same response shapes as app.py.
 async function api(method, path, body, query) {
-  query = query || {};
-  const qs = Object.entries(query)
-    .filter(([, v]) => v != null && v !== "")
-    .map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
-  const url = path + (qs ? (path.includes("?") ? "&" : "?") + qs : "");
-  const res = await fetch(url, {
-    method,
-    headers: { "Content-Type": "application/json", "X-Init-Data": state.initData },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({ error: "bad response" }));
-  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
-  return data;
+  if (!store.state) throw new Error("Приложение заблокировано");
+  const q = query || {};
+  const S = store.state;
+  const T = store.today;
+  const num = v => (v == null || v === "" ? null : Number(v));
+  if (method === "GET") {
+    switch (path) {
+      case "/api/bootstrap":
+        return { ok: true, settings: S.settings, categories: M.listCats(S).categories };
+      case "/api/summary":
+        return M.summary(S, { start: num(q.start) || 0, end: num(q.end) || 0,
+                              mode: q.mode || "month", year: num(q.year), month: num(q.month) });
+      case "/api/transactions":
+        return M.listTx(S, { type: q.type || null, category: q.category || null,
+                             payment: q.payment || null, q: q.q != null ? q.q : null,
+                             start: num(q.start), end: num(q.end) });
+      case "/api/categories": return M.listCats(S);
+      case "/api/goals": return M.listGoals(S, T);
+      case "/api/budget": return M.budget(S, num(q.year) || 0, num(q.month) || 0);
+      case "/api/budget_templates": return M.listTemplates(S);
+      case "/api/analytics": return M.analytics(S, num(q.year) || NOW.getFullYear(), T);
+      case "/api/settings": return { ok: true, settings: S.settings };
+      case "/api/export": return M.toExport(S);
+    }
+    throw new Error("no route: " + path);
+  }
+  let op = null;
+  if (method === "POST" && path === "/api/transactions") op = () => M.addTx(S, body);
+  else if (method === "PUT" && path.startsWith("/api/transactions/")) {
+    const id = path.slice("/api/transactions/".length);
+    op = () => M.updateTx(S, id, body);
+  }
+  else if (method === "DELETE" && path === "/api/transactions") op = () => M.deleteTx(S, q.id);
+  else if (method === "POST" && path === "/api/categories") op = () => M.addCat(S, body);
+  else if (method === "PUT" && path === "/api/categories") op = () => M.updateCat(S, q.name, q.type, body);
+  else if (method === "DELETE" && path === "/api/categories") op = () => M.deleteCat(S, q.name, q.type);
+  else if (method === "POST" && path === "/api/goals") op = () => M.addGoal(S, body);
+  else if (method === "PUT" && path === "/api/goals") op = () => M.updateGoal(S, q.id, body);
+  else if (method === "DELETE" && path === "/api/goals") op = () => M.deleteGoal(S, q.id);
+  else if (method === "POST" && path === "/api/goals_contribute") op = () => M.contribute(S, q.id, body, T);
+  else if (method === "POST" && path === "/api/budget/cap") op = () => M.setCap(S, body);
+  else if (method === "POST" && path === "/api/budget/plan") op = () => M.upsertPlan(S, body);
+  else if (method === "DELETE" && path === "/api/budget/plan") op = () => M.deletePlan(S, num(q.year), num(q.month), q.category, q.type);
+  else if (method === "PUT" && path === "/api/budget_templates") op = () => M.upsertTemplate(S, body);
+  else if (method === "PUT" && path === "/api/settings") op = () => {
+    const allowed = ["username", "currencySymbol", "themeMode", "budgetCopyPrevMonth"];
+    for (const k of allowed) if (k in body) S.settings[k] = body[k];
+    return { ok: true, settings: S.settings };
+  };
+  else if (method === "POST" && path === "/api/import") op = () => M.importBackup(S, body);
+  if (!op) throw new Error("no route: " + method + " " + path);
+  return store.mutate(op);
 }
 
 // --------------------------------------------------------------- theming ---
@@ -1468,13 +1794,24 @@ async function renderSettings() {
       <input type="file" id="stImportFile" accept="application/json,.json" class="hidden"></div>
       <div class="footer-note">Формат совместим с бэкапом Android-приложения MoneyAPP: транзакции, категории, цели и планы бюджета объединяются по id (upsert).</div>
     </div>
+    <div class="card setsection"><div class="head"><span class="msrc">shield</span><span class="t">Безопасность</span></div>
+      <div class="setrow"><div class="lbl">Сквозное шифрование</div>
+        <div class="val" style="color:var(--income-text)">Включено</div></div>
+      <div class="footer-note">Данные шифруются на твоём устройстве. На сервере хранится только зашифрованная копия — без ключа её не прочитает никто, даже владелец сервера.</div>
+      <div class="btnrow" style="margin-top:10px">
+        <button class="btn tonal" id="stShowPhrase"><span class="msrc">key</span>Фраза восстановления</button>
+        <button class="btn tonal" id="stChangePin"><span class="msrc">lock_reset</span>Сменить ПИН</button>
+      </div>
+      <div class="btnrow"><button class="btn tonal" id="stLock"><span class="msrc">lock</span>Заблокировать</button></div>
+    </div>
     <div class="card setsection"><div class="head"><span class="msrc">category</span><span class="t">Категории</span></div>
       <button class="btn tonal" id="stCats"><span class="msrc">edit</span>Управление категориями</button>
     </div>
     <div class="card setsection"><div class="head"><span class="msrc">info</span><span class="t">О приложении</span></div>
-      <div style="font-size:14px;font-weight:600">MoneyAPP Web v1.0</div>
+      <div style="font-size:14px;font-weight:600">MoneyAPP Web v1.12</div>
       <div class="footer-note">Персональный финансовый трекер • Telegram mini-app</div>
-      <div class="footer-note">Данные хранятся только в твоём хранилище на этом сервере.</div>
+      <div class="footer-note">Все данные шифруются прямо в мини-приложении на твоём телефоне. Ключ создаётся из твоего ПИН-кода и никуда не отправляется — не на сервер и не в Telegram. Поэтому даже владелец сервера не может прочитать твои данные.</div>
+      <div class="footer-note">При первом запуске ты получил(а) фразу из 24 слов — сохрани её в надёжном месте: это единственный способ вернуть данные, если забудешь ПИН.</div>
     </div>`;
   const saveUser = async () => {
     try {
@@ -1561,6 +1898,85 @@ async function renderSettings() {
     e.target.value = "";
   };
   el.querySelector("#stCats").onclick = () => openSub("categories");
+  el.querySelector("#stLock").onclick = () => lockApp();
+  el.querySelector("#stShowPhrase").onclick = () => phraseDialog();
+  el.querySelector("#stChangePin").onclick = () => changePinDialog();
+}
+
+// --------------------------------------------------------- E2E dialogs ----
+// Show the 24-word phrase after PIN verification (key -> mnemonic in memory).
+function phraseDialog() {
+  const dv = dialog({
+    title: "Фраза восстановления",
+    body: `
+      <div class="footer-note">Введите ПИН, чтобы показать фразу.</div>
+      <div class="field"><label>ПИН</label><input id="phPin" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div id="phBody"></div>
+      <div id="phErr" class="autherr"></div>`,
+    buttons: [
+      { label: "Закрыть", cls: "", act: "c", onclick: () => {} },
+      { label: "Показать", cls: "", act: "s", onclick: async () => {
+          const pin = dv.querySelector("#phPin").value.trim();
+          const err = dv.querySelector("#phErr");
+          const body = dv.querySelector("#phBody");
+          err.textContent = "";
+          try {
+            const words = await store.phraseForPin(pin);
+            body.innerHTML = `<div class="phrase" style="margin:12px 0">${words.map(w => `<span class="pw">${w}</span>`).join("")}</div>
+              <div class="footer-note">Эта фраза не меняется при смене ПИН. Сохраните её и никому не показывайте.</div>`;
+            const cp = document.createElement("button");
+            cp.className = "btn tonal"; cp.style.cssText = "width:100%;margin-top:8px";
+            cp.innerHTML = `<span class="msrc">copy</span>Скопировать фразу`;
+            cp.onclick = async () => {
+              try { await navigator.clipboard.writeText(words.join(" ")); snackbar("Фраза скопирована"); }
+              catch (e) { snackbar("Скопируйте слова вручную"); }
+            };
+            body.appendChild(cp);
+            dv.querySelector(".dbtn[data-act='s']").textContent = "Готово";
+            dv.querySelector(".dbtn[data-act='s']").onclick = closeDialog;
+          } catch (e) {
+            err.textContent = e.message === "wrong key" ? "Неверный ПИН" : e.message;
+          }
+        } },
+    ],
+  });
+}
+function changePinDialog() {
+  const dv = dialog({
+    title: "Сменить ПИН",
+    body: `
+      <div class="footer-note">Фраза восстановления при смене ПИН не меняется.</div>
+      <div class="field"><label>Текущий ПИН</label><input id="cpOld" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div class="field"><label>Новый ПИН (4–6 цифр)</label><input id="cpNew" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div class="field"><label>Новый ПИН ещё раз</label><input id="cpNew2" class="authpin" type="password" inputmode="numeric" maxlength="6" placeholder="••••" autocomplete="off"></div>
+      <div id="cpErr" class="autherr"></div>`,
+    buttons: [
+      { label: "Отмена", cls: "", act: "c", onclick: () => {} },
+      { label: "Сменить", cls: "", act: "s", onclick: async () => {
+          const old = dv.querySelector("#cpOld").value.trim();
+          const n1 = dv.querySelector("#cpNew").value.trim();
+          const n2 = dv.querySelector("#cpNew2").value.trim();
+          const err = dv.querySelector("#cpErr");
+          if (!C.validPin(n1)) { err.textContent = "Новый ПИН: 4–6 цифр"; return; }
+          if (n1 !== n2) { err.textContent = "Новый ПИН не совпадает"; return; }
+          try {
+            await store.changePin(old, n1);
+            snackbar("ПИН обновлён");
+            closeDialog();
+          } catch (e) {
+            err.textContent = e.message === "wrong key" ? "Неверный текущий ПИН" : e.message;
+          }
+        } },
+    ],
+  });
+}
+// Lock: wipe the in-memory key/state and ask for the PIN again.
+function lockApp() {
+  closeDialog();
+  store.state = null; store.key = null; store.pin = null; store.rev = -1;
+  document.getElementById("fab").classList.add("hidden");
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  screenPin();
 }
 
 // ============================================================= CATEGORIES ===
@@ -1696,16 +2112,31 @@ async function boot() {
        <div class="h">Мини-приложение работает через кнопку в боте @MoneyApp01_bot</div></div>`;
     return;
   }
+  state.user = JSON.parse(new URLSearchParams(state.initData).get("user") || "{}");
+  store.uid = state.user.id || 0;
+  // Stale-JS banner: the server knows the deployed web version (no auth),
+  // so even a cached copy of the app can offer a reload.
   try {
-    const b = await api("GET", "/api/bootstrap");
-    state.user = JSON.parse(new URLSearchParams(state.initData).get("user") || "{}");
-    state.settings = b.settings;
-    state.categories = b.categories;
-    if (!state.settings.username && state.user && state.user.first_name) {
-      state.settings.username = state.user.first_name;
+    const v = await store.http("GET", "/api/version");
+    if (v.webVer !== WEB_APP_VERSION) showVBanner();
+  } catch (e) { /* ignore */ }
+  try {
+    const d = await store.http("GET", "/api/blob");
+    store.rev = d.rev;
+    store.today = d.today;
+    if (d.has) { screenPin(); return; }
+    // No blob yet: either a migration (legacy DB with real data) or a
+    // fresh first launch. Both start with the PIN setup screen.
+    let exp = null;
+    try { const l = await store.http("GET", "/api/legacy"); exp = l.export; } catch (e) { /* none */ }
+    if (exp && M.hasRealData(exp)) {
+      authCtx.mode = "migrate";
+      authCtx.legacyExport = exp;
+      screenNewPin(`<div class="authh">Мы перенесём твои данные из старого хранилища и зашифруем их на этом устройстве. После переноса прочитать их сможет только твой ПИН.</div>`);
+    } else {
+      authCtx.mode = "setup";
+      screenNewPin(`<div class="authh">Защитим твои данные: придумай ПИН, а затем сохрани фразу восстановления. Даже владелец сервера не сможет прочитать твои финансы.</div>`);
     }
-    applyTheme(state.settings.themeMode || "system");
-    showTab("dashboard");
   } catch (e) {
     document.getElementById("content").innerHTML =
       `<div class="empty" style="padding-top:120px"><div class="box"><span class="msrc">error</span></div>

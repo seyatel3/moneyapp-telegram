@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """MoneyApp Telegram mini-app: bot + API + static web server.
 
-Multi-user: every Telegram user gets an isolated SQLite database
-(data/users/<user_id>/db.sqlite3). Access to the API is authorized ONLY by
-Telegram WebApp initData (HMAC-SHA256 verified against the bot token), so a
-user can never read another user's data.
+Multi-user: every Telegram user gets an isolated, E2E-ENCRYPTED store
+(data/users/<user_id>/blob.json). All business logic runs in the browser
+(web/logic.js); the user's data is encrypted client-side (AES-GCM under a
+random 32 B master key wrapped with PBKDF2(PIN)) and the server only keeps
+the opaque blob — it cannot read anyone's data. Access to the API is
+authorized ONLY by Telegram WebApp initData (HMAC-SHA256 verified against
+the bot token), so a user can never read another user's blob.
+
+The legacy per-user SQLite databases (data/users/<uid>/db.sqlite3) stay
+around as a read-only migration source (GET /api/legacy); after a user
+migrates, the DB is renamed to db.sqlite3.bak-<ts> (30-day undo window) and
+migrated.json marks the switch. The old /api/* computation endpoints remain
+for the bot's /stats fallback and pre-migration users.
 
 Stdlib only (Python 3.12+). Data model mirrors the Android app:
 amounts in kopecks (positive int), dates as epoch days.
@@ -36,6 +45,10 @@ TG_API = "https://api.telegram.org"
 INIT_DATA_MAX_AGE = 24 * 3600  # initData auth_date freshness window, seconds
 RATE_LIMIT_PER_MIN = 60        # per IP, all API endpoints
 MAX_BODY = 8 * 1024 * 1024
+# Bump on every web/ deploy. Served at GET /api/version (no auth); the mini-app
+# shows a reload banner when its own embedded version differs (static files
+# are cached with max-age=300).
+WEB_VERSION = 12
 
 # ---------------------------------------------------------------- config ---
 def load_env():
@@ -61,6 +74,31 @@ MONTHS_FULL = ["Январь", "Февраль", "Март", "Апрель", "М
                "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 MONTHS_SHORT = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн",
                 "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+# E2E (v1.11.10): privacy notes in words a regular user understands —
+# the server owner cannot read the user's data. Shared by /start, /help
+# and the migrated /stats.
+E2E_NOTE_BOT = (
+    "🔒 Твоя приватность: все твои финансы шифруются прямо в мини-приложении "
+    "на твоём телефоне. На сервере хранится только зашифрованный набор данных, "
+    "а ключ создаётся из твоего ПИН-кода и никуда не отправляется — не на "
+    "сервер и не в Telegram. Поэтому даже я, владелец сервера, не могу "
+    "прочитать твои данные. Их видишь только ты.")
+E2E_NOTE_LONG = (
+    "🔒 Твоя приватность (сквозное шифрование):\n"
+    "Деньги, операции, бюджеты и цели шифруются прямо в мини-приложении на "
+    "твоём телефоне. На сервере лежит только зашифрованный набор данных — "
+    "без ключа это нечитаемая строка. Ключ создаётся из твоего ПИН-кода и "
+    "никуда не отправляется: ни на сервер, ни в Telegram. Поэтому даже я — "
+    "владелец сервера — не могу прочитать твои данные. Их видишь только ты.\n\n"
+    "Расшифровать данные могут только твой ПИН-код и фраза из 24 слов, "
+    "которую ты сохраняешь при первом запуске. Если забудешь и то, и другое, "
+    "восстановить данные будет невозможно — сохрани фразу в надёжном месте.")
+E2E_STATS = (
+    "🔒 Твои данные защищены сквозным шифрованием (E2E): сервер хранит только "
+    "зашифрованную копию, а ключ создаётся из твоего ПИН-кода и никуда не "
+    "отправляется — даже владелец сервера не может прочитать твои данные.\n\n"
+    "Открой мини-приложение — остаток и все отчёты там:")
 
 def today_epoch():
     return (date.today() - date(1970, 1, 1)).days
@@ -567,7 +605,10 @@ class Api:
         sql = f"SELECT {TX_COLS} FROM transactions"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY date DESC, createdAt DESC LIMIT 2000"
+        # rowid DESC pins the (date, createdAt) tie order (imported rows can
+        # share timestamps): it reproduces SQLite's actual DESC output and
+        # mirrors web/logic.js listTx (index DESC) after E2E migration.
+        sql += " ORDER BY date DESC, createdAt DESC, rowid DESC LIMIT 2000"
         return {"ok": True, "transactions": [tx_row_to_dict(r) for r in
                                              self.db.execute(sql, args).fetchall()]}
 
@@ -689,7 +730,7 @@ class Api:
     def list_goals(self):
         today = today_epoch()
         out = []
-        for g in self.db.execute("SELECT * FROM savings_goals ORDER BY createdAt"):
+        for g in self.db.execute("SELECT * FROM savings_goals ORDER BY createdAt, rowid"):
             cur_sum = self.db.execute(
                 "SELECT COALESCE(SUM(amountKopecks),0) FROM transactions "
                 "WHERE type='SAVINGS' AND category=?", (g["name"],)).fetchone()[0]
@@ -1058,18 +1099,32 @@ class Api:
     # ---- export / import (Android BackupData-compatible)
     def export(self):
         s = self.settings()
-        txs = [tx_row_to_dict(r) for r in self.db.execute(
-            f"SELECT {TX_COLS} FROM transactions ORDER BY date, createdAt")]
+        # rowid is carried so the E2E web app can reproduce SQLite's tie
+        # order (web/logic.js listTx/bigExpenses). Android's Moshi adapter
+        # ignores the unknown field; the legacy importer never reads it.
+        txs = []
+        for r in self.db.execute(
+                f"SELECT {TX_COLS}, rowid FROM transactions "
+                "ORDER BY date, createdAt, rowid"):
+            d = tx_row_to_dict(r)
+            d["rowid"] = r[11]
+            txs.append(d)
         cats = [dict(r) for r in self.db.execute(
             "SELECT name,type,emoji,icon,isVisible,sortOrder FROM categories")]
-        goals = [dict(r) for r in self.db.execute("SELECT * FROM savings_goals")]
+        goals = [dict(r) for r in self.db.execute(
+            "SELECT *, rowid FROM savings_goals ORDER BY rowid")]
         plans = [dict(r) for r in self.db.execute("SELECT * FROM budget_plans")]
         templates = [dict(r) for r in self.db.execute(
             "SELECT category,type,amountKopecks FROM budget_templates")]
         return {"app": "moneyapp", "version": 1, "exportedAt": int(time.time() * 1000),
                 "username": s.get("username", ""), "transactions": txs,
                 "goals": goals, "categories": cats, "budgets": plans,
-                "budgetTemplates": templates}
+                "budgetTemplates": templates,
+                # settings are NOT part of the Android BackupData format,
+                # but Android's Moshi ignores unknown keys — carrying them
+                # keeps budget caps/links/username through export-import and
+                # through the E2E migration (where they would be lost).
+                "settings": s}
 
     def import_backup(self, body):
         if not isinstance(body, dict) or not isinstance(body.get("transactions"), list):
@@ -1154,11 +1209,98 @@ class Api:
                 "catAdded": cat_added, "goalAdded": g_added, "budgetAdded": b_added,
                 "templateAdded": t_added}
 
+    # ---- E2E blob store (opaque to the server) ----
+    def user_dir(self):
+        return os.path.join(USERS_DIR, str(self.uid))
+
+    def blob_path(self):
+        return os.path.join(self.user_dir(), "blob.json")
+
+    def get_blob(self):
+        """Encrypted blob + rev (optimistic lock) + the server's today (MSK):
+        all date math must use the server's day, not the device's timezone."""
+        p = self.blob_path()
+        rev, blob = 0, None
+        if os.path.exists(p):
+            try:
+                d = json.load(open(p))
+                rev = int(d.get("rev", 0))
+                blob = d.get("blob")
+            except Exception:
+                raise HttpError(500, "blob corrupt")
+        return {"ok": True, "has": blob is not None, "blob": blob,
+                "rev": rev, "today": today_epoch()}
+
+    def put_blob(self, body):
+        if not isinstance(body, dict) or not isinstance(body.get("blob"), dict):
+            raise HttpError(400, "bad request")
+        blob = body["blob"]
+        _validate_blob(blob)
+        p = self.blob_path()
+        cur = {"rev": 0}
+        if os.path.exists(p):
+            try:
+                cur = json.load(open(p))
+            except Exception:
+                raise HttpError(500, "blob corrupt")
+        want = int(body.get("rev", -1))
+        if int(cur.get("rev", 0)) != want:
+            raise HttpError(409, "conflict",
+                            {"error": "conflict", "rev": int(cur.get("rev", 0))})
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"rev": want + 1, "blob": blob}, f)
+        os.replace(tmp, p)  # atomic
+        return {"ok": True, "rev": want + 1}
+
+    def legacy(self):
+        """One-time plaintext export of the pre-E2E database, used only by the
+        migration screen. Returns 404 once the user has migrated."""
+        if os.path.exists(os.path.join(self.user_dir(), "migrated.json")):
+            raise HttpError(404, "migrated")
+        # settings ride along so the migration keeps caps/links/theme intact
+        return {"ok": True, "export": self.export()}
+
+    def migration_complete(self):
+        """Mark the migration done: the legacy DB is renamed (not deleted —
+        30-day undo window, cleaned up by the cleanup loop) and a marker is
+        written so GET /api/legacy and the bot's /stats know."""
+        d = self.user_dir()
+        m = os.path.join(d, "migrated.json")
+        if os.path.exists(m):
+            return {"ok": True, "already": True}
+        dbp = os.path.join(d, "db.sqlite3")
+        ts = int(time.time())
+        if os.path.exists(dbp):
+            os.replace(dbp, os.path.join(d, f"db.sqlite3.bak-{ts}"))
+        with open(m, "w") as f:
+            json.dump({"migrated_at": ts}, f)
+        return {"ok": True}
+
 # ---------------------------------------------------------------- HTTP layer --
+
+def _validate_blob(blob):
+    """Shape check for the E2E blob: {v:1, ivKey(12B), ctKey(48B), iv(12B),
+    ct(>=32B)} in base64. The server never decodes the payloads — it only
+    refuses structurally broken or oversized blobs."""
+    for k in ("ivKey", "ctKey", "iv", "ct"):
+        if not isinstance(blob.get(k), str):
+            raise HttpError(400, "bad blob")
+    if blob.get("v") != 1:
+        raise HttpError(400, "bad blob")
+    try:
+        ivk = base64.b64decode(blob["ivKey"])
+        ctk = base64.b64decode(blob["ctKey"])
+        iv = base64.b64decode(blob["iv"])
+        ct = base64.b64decode(blob["ct"])
+    except Exception:
+        raise HttpError(400, "bad blob")
+    if len(ivk) != 12 or len(ctk) != 48 or len(iv) != 12 or not (32 <= len(ct) <= MAX_BODY):
+        raise HttpError(400, "bad blob")
 class HttpError(Exception):
-    def __init__(self, code, msg):
+    def __init__(self, code, msg, payload=None):
         super().__init__(msg)
-        self.code, self.msg = code, msg
+        self.code, self.msg, self.payload = code, msg, payload
 
 ROUTES = {
     ("GET", "/api/bootstrap"): lambda api, q, b: api.bootstrap(),
@@ -1186,6 +1328,12 @@ ROUTES = {
     ("POST", "/api/import"): lambda api, q, b: api.import_backup(b),
     ("GET", "/api/settings"): lambda api, q, b: {"ok": True, "settings": api.settings()},
     ("PUT", "/api/settings"): lambda api, q, b: handle_settings_put(api, b),
+    # E2E (v1.11.10): the mini-app now does all computation in the browser
+    # and talks to these opaque-blob endpoints only.
+    ("GET", "/api/blob"): lambda api, q, b: api.get_blob(),
+    ("PUT", "/api/blob"): lambda api, q, b: api.put_blob(b),
+    ("GET", "/api/legacy"): lambda api, q, b: api.legacy(),
+    ("POST", "/api/migration_complete"): lambda api, q, b: api.migration_complete(),
 }
 
 def handle_settings_put(api, body):
@@ -1285,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 api.close()
         except HttpError as e:
-            self._send(e.code, {"error": e.msg})
+            self._send(e.code, e.payload if e.payload is not None else {"error": e.msg})
         except Exception as e:
             try:
                 self._send(500, {"error": f"internal: {type(e).__name__}: {e}"})
@@ -1309,6 +1457,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send(200, {"ok": True, "ts": int(time.time())})
+            return
+        if self.path.split("?", 1)[0] == "/api/version":
+            # no auth: a stale-JS client (even with an expired initData)
+            # must still be able to notice the deploy and offer a reload
+            self._send(200, {"ok": True, "webVer": WEB_VERSION})
             return
         if self.path.startswith("/api/"):
             self._api("GET")
@@ -1390,9 +1543,8 @@ def handle_update(upd):
         ensure_user_db(uid)
         set_owner_if_empty(uid)
         welcome = ("Привет! Я MoneyAPP — твой финансовый трекер.\n\n"
-                   "Нажми кнопку, чтобы открыть мини-приложение. Все твои данные "
-                   "хранятся только у тебя: каждая учётная запись Telegram "
-                   "получает собственное изолированное хранилище.")
+                   "Нажми кнопку, чтобы открыть мини-приложение.\n\n"
+                   + E2E_NOTE_BOT)
         if os.path.exists(SEED_FILE) and get_owner_id() == uid:
             try:
                 backup = json.load(open(SEED_FILE))
@@ -1407,6 +1559,12 @@ def handle_update(upd):
                     {"text": "Открыть MoneyAPP",
                      "web_app": {"url": WEBAPP_URL}}]]})
     elif text == "/stats":
+        if os.path.exists(os.path.join(USERS_DIR, str(uid), "migrated.json")):
+            tg_send(chat["id"], E2E_STATS,
+                    reply_markup={"inline_keyboard": [[
+                        {"text": "Открыть MoneyAPP",
+                         "web_app": {"url": WEBAPP_URL}}]]})
+            return
         ensure_user_db(uid)
         y, m = date.today().year, date.today().month
         api = Api(uid)
@@ -1436,7 +1594,8 @@ def handle_update(upd):
         tg_send(chat["id"],
                 "Команды:\n/start — открыть мини-приложение\n"
                 "/stats — остаток за текущий месяц\n"
-                "/backup — файл резервной копии (только владелец)\n/help — эта справка")
+                "/backup — файл резервной копии (только владелец)\n"
+                "/help — эта справка\n\n" + E2E_NOTE_LONG)
     else:
         tg_send(chat["id"], "Кнопка «Открыть MoneyAPP» есть в сообщении /start. Команды: /stats, /backup, /help")
 
@@ -1461,10 +1620,33 @@ def bot_loop():
             time.sleep(5)
 
 # -------------------------------------------------------------------- main --
+def cleanup_legacy_backups():
+    """Remove db.sqlite3.bak-* older than 30 days (post-migration undo
+    window). Runs once at start and every 6 h in a daemon thread."""
+    cutoff = time.time() - 30 * 86400
+    try:
+        for entry in os.scandir(USERS_DIR):
+            if not entry.is_dir():
+                continue
+            for f in os.scandir(entry.path):
+                if f.name.startswith("db.sqlite3.bak-") and f.is_file() \
+                        and f.stat().st_mtime < cutoff:
+                    os.unlink(f.path)
+                    print(f"[cleanup] removed {f.path}", flush=True)
+    except Exception as e:
+        print(f"[cleanup] error: {e}", flush=True)
+
+def cleanup_loop():
+    while True:
+        cleanup_legacy_backups()
+        time.sleep(6 * 3600)
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing (.env)")
     os.makedirs(USERS_DIR, exist_ok=True)
+    threading.Thread(target=cleanup_legacy_backups, daemon=True).start()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
