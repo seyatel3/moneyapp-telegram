@@ -542,11 +542,19 @@ def seed_owner_db(user_id, backup):
 class Api:
     def __init__(self, user_id):
         self.uid = int(user_id)
-        self.db = open_user_db(self.uid)
-        self.db.row_factory = sqlite3.Row
+        # migrated users have no legacy db (old-format files are removed);
+        # their /api/blob + /api/migration_complete + /api/legacy endpoints
+        # do not touch self.db
+        p = os.path.join(USERS_DIR, str(self.uid), "db.sqlite3")
+        if os.path.exists(p):
+            self.db = open_user_db(self.uid)
+            self.db.row_factory = sqlite3.Row
+        else:
+            self.db = None
 
     def close(self):
-        self.db.close()
+        if self.db:
+            self.db.close()
 
     def settings(self):
         return get_settings(self.db)
@@ -1414,7 +1422,14 @@ class Handler(BaseHTTPRequestHandler):
             q = {}
             if "?" in self.path:
                 q = urllib.parse.parse_qs(self.path.split("?", 1)[1])
-            ensure_user_db(user["id"])
+            if os.path.exists(os.path.join(USERS_DIR, str(user["id"]), "migrated.json")):
+                # post-E2E: no legacy db is recreated; only the blob endpoints
+                # and the migration endpoints remain (legacy() self-404s)
+                if path not in ("/api/blob", "/api/migration_complete", "/api/legacy"):
+                    self._send(404, {"error": "migrated"})
+                    return
+            else:
+                ensure_user_db(user["id"])
             api = Api(user["id"])
             try:
                 body = self._read_body() if method in ("POST", "PUT") else {}
